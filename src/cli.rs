@@ -418,12 +418,12 @@ pub async fn cli() -> Result<(), Box<dyn Error>> {
         }
 
         let config_ctrlc_exit = config::config(Tag::unknown())?
-                    .get("ctrlc_exit")
-                    .map(|s| match s.as_string().unwrap().as_ref() {
-                        "true" => true,
-                        _ => false,
-                    })
-                    .unwrap_or(false); // default behavior is to allow CTRL-C spamming similar to other shells
+            .get("ctrlc_exit")
+            .map(|s| match s.as_string().unwrap().as_ref() {
+                "true" => true,
+                _ => false,
+            })
+            .unwrap_or(false); // default behavior is to allow CTRL-C spamming similar to other shells
 
         enum LoopAction {
             Break,
