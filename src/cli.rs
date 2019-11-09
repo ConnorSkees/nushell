@@ -417,14 +417,7 @@ pub async fn cli() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        match process_line(readline, &mut context).await {
-            LineResult::Success(line) => {
-                rl.add_history_entry(line.clone());
-                let _ = rl.save_history(&History::path());
-            }
-
-            LineResult::CtrlC => {
-                let config_ctrlc_exit = config::config(Tag::unknown())?
+        let config_ctrlc_exit = config::config(Tag::unknown())?
                     .get("ctrlc_exit")
                     .map(|s| match s.as_string().unwrap().as_ref() {
                         "true" => true,
@@ -432,6 +425,15 @@ pub async fn cli() -> Result<(), Box<dyn Error>> {
                     })
                     .unwrap_or(false); // default behavior is to allow CTRL-C spamming similar to other shells
 
+        enum LoopAction {
+            Break,
+            Continue,
+            None,
+        }
+        let mut loop_action = LoopAction::None;
+        let line: String = match readline {
+            Ok(l) => l,
+            Err(ReadlineError::Interrupted) => {
                 if !config_ctrlc_exit {
                     continue;
                 }
@@ -444,22 +446,61 @@ pub async fn cli() -> Result<(), Box<dyn Error>> {
                     ctrlcbreak = true;
                     continue;
                 }
-            }
-
-            LineResult::Error(line, err) => {
-                rl.add_history_entry(line.clone());
-                let _ = rl.save_history(&History::path());
-
-                context.with_host(|host| {
-                    print_err(err, host, &Text::from(line));
-                })
-            }
-
-            LineResult::Break => {
+            },
+            Err(ReadlineError::Eof) => break,
+            Err(err) => {
+                println!("Error: {:?}", err);
                 break;
+            }
+        };
+
+        for l in line.split("&&") {
+            match process_line(l, &mut context).await {
+                LineResult::Success(_) => continue,
+
+                LineResult::CtrlC => {
+                    if !config_ctrlc_exit {
+                        loop_action = LoopAction::Continue;
+                        break;
+                    }
+                    
+                    if ctrlcbreak {
+                        let _ = rl.save_history(&History::path());
+                        std::process::exit(0);
+                    } else {
+                        context.with_host(|host| host.stdout("CTRL-C pressed (again to quit)"));
+                        // the compiler isn't able to detect that this can loop, so incorrectly
+                        // warns that the assignment is never read
+                        #[allow(unused_assignments)]
+                        { ctrlcbreak = true; }
+                        loop_action = LoopAction::Continue;
+                        break;
+                    }
+                }
+
+                LineResult::Error(line, err) => {
+                    rl.add_history_entry(line.clone());
+                    let _ = rl.save_history(&History::path());
+
+                    context.with_host(|host| {
+                        print_err(err, host, &Text::from(line));
+                    });
+                    break;
+                }
+
+                LineResult::Break => {
+                    loop_action = LoopAction::Break;
+                    break;
+                }
             }
         }
         ctrlcbreak = false;
+        
+        match loop_action {
+            LoopAction::Break => break,
+            LoopAction::Continue => continue,
+            LoopAction::None => {},
+        };
     }
 
     // we are ok if we can not save history
@@ -547,161 +588,154 @@ enum LineResult {
     Break,
 }
 
-async fn process_line(readline: Result<String, ReadlineError>, ctx: &mut Context) -> LineResult {
-    match &readline {
-        Ok(line) if line.trim() == "" => LineResult::Success(line.clone()),
+async fn process_line(line: &str, ctx: &mut Context) -> LineResult {
+        if line.trim() == "" {
+            return LineResult::Success(line.to_owned())
+        }
 
-        Ok(line) => {
-            let line = chomp_newline(line);
+        let line = chomp_newline(line);
 
-            let result = match crate::parser::parse(&line) {
-                Err(err) => {
-                    return LineResult::Error(line.to_string(), err);
-                }
-
-                Ok(val) => val,
-            };
-
-            debug!("=== Parsed ===");
-            debug!("{:#?}", result);
-
-            let mut pipeline = match classify_pipeline(&result, ctx, &Text::from(line)) {
-                Ok(pipeline) => pipeline,
-                Err(err) => return LineResult::Error(line.to_string(), err),
-            };
-
-            match pipeline.commands.last() {
-                Some(ClassifiedCommand::External(_)) => {}
-                _ => pipeline
-                    .commands
-                    .item
-                    .push(ClassifiedCommand::Internal(InternalCommand {
-                        name: "autoview".to_string(),
-                        name_tag: Tag::unknown(),
-                        args: hir::Call::new(
-                            Box::new(hir::Expression::synthetic_string("autoview")),
-                            None,
-                            None,
-                        )
-                        .spanned_unknown(),
-                    })),
+        let result = match crate::parser::parse(&line) {
+            Err(err) => {
+                return LineResult::Error(line.to_string(), err);
             }
 
-            let mut input = ClassifiedInputStream::new();
-            let mut iter = pipeline.commands.item.into_iter().peekable();
+            Ok(val) => val,
+        };
 
-            // Check the config to see if we need to update the path
-            // TODO: make sure config is cached so we don't path this load every call
-            set_env_from_config();
+        debug!("=== Parsed ===");
+        debug!("{:#?}", result);
 
-            loop {
-                let item: Option<ClassifiedCommand> = iter.next();
-                let next: Option<&ClassifiedCommand> = iter.peek();
+        let mut pipeline = match classify_pipeline(&result, ctx, &Text::from(line)) {
+            Ok(pipeline) => pipeline,
+            Err(err) => return LineResult::Error(line.to_string(), err),
+        };
 
-                input = match (item, next) {
-                    (None, _) => break,
+        match pipeline.commands.last() {
+            Some(ClassifiedCommand::External(_)) => {}
+            _ => pipeline
+                .commands
+                .item
+                .push(ClassifiedCommand::Internal(InternalCommand {
+                    name: "autoview".to_string(),
+                    name_tag: Tag::unknown(),
+                    args: hir::Call::new(
+                        Box::new(hir::Expression::synthetic_string("autoview")),
+                        None,
+                        None,
+                    )
+                    .spanned_unknown(),
+                })),
+        }
 
-                    (Some(ClassifiedCommand::Dynamic(_)), _)
-                    | (_, Some(ClassifiedCommand::Dynamic(_))) => {
-                        return LineResult::Error(
-                            line.to_string(),
-                            ShellError::unimplemented("Dynamic commands"),
-                        )
-                    }
+        let mut input = ClassifiedInputStream::new();
+        let mut iter = pipeline.commands.item.into_iter().peekable();
 
-                    (Some(ClassifiedCommand::Expr(_)), _) => {
-                        return LineResult::Error(
-                            line.to_string(),
-                            ShellError::unimplemented("Expression-only commands"),
-                        )
-                    }
+        // Check the config to see if we need to update the path
+        // TODO: make sure config is cached so we don't path this load every call
+        set_env_from_config();
 
-                    (_, Some(ClassifiedCommand::Expr(_))) => {
-                        return LineResult::Error(
-                            line.to_string(),
-                            ShellError::unimplemented("Expression-only commands"),
-                        )
-                    }
+        loop {
+            let item: Option<ClassifiedCommand> = iter.next();
+            let next: Option<&ClassifiedCommand> = iter.peek();
 
-                    (
-                        Some(ClassifiedCommand::Internal(left)),
-                        Some(ClassifiedCommand::External(_)),
-                    ) => match left.run(ctx, input, Text::from(line)) {
+            input = match (item, next) {
+                (None, _) => break,
+
+                (Some(ClassifiedCommand::Dynamic(_)), _)
+                | (_, Some(ClassifiedCommand::Dynamic(_))) => {
+                    return LineResult::Error(
+                        line.to_string(),
+                        ShellError::unimplemented("Dynamic commands"),
+                    )
+                }
+
+                (Some(ClassifiedCommand::Expr(_)), _) => {
+                    return LineResult::Error(
+                        line.to_string(),
+                        ShellError::unimplemented("Expression-only commands"),
+                    )
+                }
+
+                (_, Some(ClassifiedCommand::Expr(_))) => {
+                    return LineResult::Error(
+                        line.to_string(),
+                        ShellError::unimplemented("Expression-only commands"),
+                    )
+                }
+
+                (
+                    Some(ClassifiedCommand::Internal(left)),
+                    Some(ClassifiedCommand::External(_)),
+                ) => match left.run(ctx, input, Text::from(line)) {
+                    Ok(val) => ClassifiedInputStream::from_input_stream(val),
+                    Err(err) => return LineResult::Error(line.to_string(), err),
+                },
+
+                (Some(ClassifiedCommand::Internal(left)), Some(_)) => {
+                    match left.run(ctx, input, Text::from(line)) {
                         Ok(val) => ClassifiedInputStream::from_input_stream(val),
                         Err(err) => return LineResult::Error(line.to_string(), err),
-                    },
-
-                    (Some(ClassifiedCommand::Internal(left)), Some(_)) => {
-                        match left.run(ctx, input, Text::from(line)) {
-                            Ok(val) => ClassifiedInputStream::from_input_stream(val),
-                            Err(err) => return LineResult::Error(line.to_string(), err),
-                        }
                     }
+                }
 
-                    (Some(ClassifiedCommand::Internal(left)), None) => {
-                        match left.run(ctx, input, Text::from(line)) {
-                            Ok(val) => {
-                                use futures::stream::TryStreamExt;
+                (Some(ClassifiedCommand::Internal(left)), None) => {
+                    match left.run(ctx, input, Text::from(line)) {
+                        Ok(val) => {
+                            use futures::stream::TryStreamExt;
 
-                                let mut output_stream: OutputStream = val.into();
-                                loop {
-                                    match output_stream.try_next().await {
-                                        Ok(Some(ReturnSuccess::Value(Tagged {
-                                            item: Value::Error(e),
-                                            ..
-                                        }))) => {
-                                            return LineResult::Error(line.to_string(), e);
-                                        }
-                                        Ok(Some(_item)) => {
-                                            if ctx.ctrl_c.load(Ordering::SeqCst) {
-                                                break;
-                                            }
-                                        }
-                                        _ => {
+                            let mut output_stream: OutputStream = val.into();
+                            loop {
+                                match output_stream.try_next().await {
+                                    Ok(Some(ReturnSuccess::Value(Tagged {
+                                        item: Value::Error(e),
+                                        ..
+                                    }))) => {
+                                        return LineResult::Error(line.to_string(), e);
+                                    }
+                                    Ok(Some(_item)) => {
+                                        if ctx.ctrl_c.load(Ordering::SeqCst) {
                                             break;
                                         }
                                     }
+                                    _ => {
+                                        break;
+                                    }
                                 }
-
-                                return LineResult::Success(line.to_string());
                             }
-                            Err(err) => return LineResult::Error(line.to_string(), err),
-                        }
-                    }
 
-                    (
-                        Some(ClassifiedCommand::External(left)),
-                        Some(ClassifiedCommand::External(_)),
-                    ) => match left.run(ctx, input, StreamNext::External).await {
+                            return LineResult::Success(line.to_string());
+                        }
+                        Err(err) => return LineResult::Error(line.to_string(), err),
+                    }
+                }
+
+                (
+                    Some(ClassifiedCommand::External(left)),
+                    Some(ClassifiedCommand::External(_)),
+                ) => match left.run(ctx, input, StreamNext::External).await {
+                    Ok(val) => val,
+                    Err(err) => return LineResult::Error(line.to_string(), err),
+                },
+
+                (Some(ClassifiedCommand::External(left)), Some(_)) => {
+                    match left.run(ctx, input, StreamNext::Internal).await {
                         Ok(val) => val,
                         Err(err) => return LineResult::Error(line.to_string(), err),
-                    },
-
-                    (Some(ClassifiedCommand::External(left)), Some(_)) => {
-                        match left.run(ctx, input, StreamNext::Internal).await {
-                            Ok(val) => val,
-                            Err(err) => return LineResult::Error(line.to_string(), err),
-                        }
                     }
+                }
 
-                    (Some(ClassifiedCommand::External(left)), None) => {
-                        match left.run(ctx, input, StreamNext::Last).await {
-                            Ok(val) => val,
-                            Err(err) => return LineResult::Error(line.to_string(), err),
-                        }
+                (Some(ClassifiedCommand::External(left)), None) => {
+                    match left.run(ctx, input, StreamNext::Last).await {
+                        Ok(val) => val,
+                        Err(err) => return LineResult::Error(line.to_string(), err),
                     }
-                };
-            }
+                }
+            };
+        }
 
-            LineResult::Success(line.to_string())
-        }
-        Err(ReadlineError::Interrupted) => LineResult::CtrlC,
-        Err(ReadlineError::Eof) => LineResult::Break,
-        Err(err) => {
-            println!("Error: {:?}", err);
-            LineResult::Break
-        }
-    }
+        LineResult::Success(String::new())
+        
 }
 
 fn classify_pipeline(
